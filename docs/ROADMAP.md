@@ -9,22 +9,27 @@
 
 ## Phase 1: Define requirements
 
-- [ ] Confirm the first problem ISAAC1 should solve.
-- [ ] Identify the first user workflow.
-- [ ] Define expected inputs and outputs.
-- [ ] Record constraints and risks.
+- [x] Confirm the first problem ISAAC1 should solve.
+- [x] Identify the first user workflow.
+- [x] Define expected inputs and outputs.
+- [x] Record constraints and risks.
 
 ## Phase 2: Build first working prototype
 
-- [ ] Implement the smallest useful feature.
-- [ ] Add tests for the first workflow.
-- [ ] Add simple command-line or app entry point as needed.
+- [x] Add an initial RUT241 diagnostic command.
+- [ ] Confirm RUT241 SSH access method in the field.
+- [ ] Confirm SIM, signal strength, operator, and internet connectivity from a real RUT241.
+- [ ] Select and configure secure remote access for software updates.
+- [ ] Obtain or verify SIP-T21 relay HTTP API details.
+- [ ] Build the first relay on/off command path.
+- [ ] Add the first user interface for relay control.
 
 ## Phase 3: Test and refine
 
 - [ ] Run tests consistently.
 - [ ] Validate behavior against real requirements.
 - [ ] Refine naming, structure, and user-facing output.
+- [ ] Test against the RUT241 and SIP-T21 hardware together.
 
 ## Phase 4: Prepare release/demo
 

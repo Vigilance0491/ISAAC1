@@ -1,6 +1,4 @@
-def main() -> int:
-    print("ISAAC1 project scaffold is ready.")
-    return 0
+from isaac1.rut241 import main
 
 
 if __name__ == "__main__":
