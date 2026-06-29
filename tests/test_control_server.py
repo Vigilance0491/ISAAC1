@@ -8,6 +8,7 @@ from isaac1.control_server import (
     AuthUser,
     ControlState,
     INDEX_HTML,
+    LowBatteryMode,
     MACKAY_TIMEZONE,
     MIN_AVERAGE_INTERVAL_MINUTES,
     hash_password,
@@ -31,6 +32,19 @@ class FakeHardwareClient:
     def start_sound(self, file_id):
         self.calls.append(("start", file_id))
         return {"ok": True}
+
+
+class FakeRut241InputProvider:
+    def __init__(self, states):
+        self.states = list(states)
+        self.calls = 0
+
+    def get_input_state(self):
+        self.calls += 1
+        state = self.states.pop(0)
+        if isinstance(state, Exception):
+            raise state
+        return state
 
 
 def daylight_now():
@@ -115,6 +129,147 @@ def test_control_page_has_iphone_home_screen_metadata():
     assert 'apple-mobile-web-app-capable' in INDEX_HTML
     assert 'rel="manifest"' in INDEX_HTML
     assert 'rel="apple-touch-icon"' in INDEX_HTML
+
+
+def test_control_page_has_low_battery_button_styles():
+    assert '#unitOn[data-low-battery="false"][data-active="false"]' in INDEX_HTML
+    assert '#unitOn[data-low-battery="false"][data-active="true"]' in INDEX_HTML
+    assert '#unitOn[data-low-battery="true"]' in INDEX_HTML
+    assert INDEX_HTML.count("@keyframes lowBatteryFlash") == 1
+
+
+def test_rut_input_high_at_startup_keeps_unit_button_normal():
+    client = FakeHardwareClient()
+    state = ControlState(client, now_provider=daylight_now, start_background_threads=False)
+
+    snapshot = state.apply_rut241_input_state("HIGH")
+
+    assert snapshot["lowBatteryOverride"] is False
+    assert snapshot["unitButtonEnabled"] is True
+    assert snapshot["unitButtonVisualState"] == "off"
+    assert state.toggle_unit()["unitOn"] is True
+
+
+def test_rut_input_low_at_startup_disables_unit_button():
+    client = FakeHardwareClient()
+    state = ControlState(client, now_provider=daylight_now, start_background_threads=False)
+
+    snapshot = state.apply_rut241_input_state("LOW")
+
+    assert snapshot["lowBatteryOverride"] is True
+    assert snapshot["lowBatteryMode"] == LowBatteryMode.LOW_BATTERY_OVERRIDE.value
+    assert snapshot["unitButtonEnabled"] is False
+    assert snapshot["unitButtonLabel"] == "LOW BATTERY"
+    assert snapshot["unitButtonVisualState"] == "low-battery"
+    try:
+        state.toggle_unit()
+    except RuntimeError as exc:
+        assert "low battery" in str(exc)
+    else:
+        raise AssertionError("expected low-battery guard")
+
+
+def test_rut_input_high_to_low_saves_state_once_and_blocks_operation():
+    client = FakeHardwareClient()
+    state = ControlState(client, now_provider=daylight_now, start_background_threads=False)
+    state.toggle_unit()
+
+    snapshot = state.apply_rut241_input_state("LOW")
+    saved_state = state._saved_unit_button_state
+    repeated_snapshot = state.apply_rut241_input_state("LOW")
+
+    assert snapshot["unitOn"] is False
+    assert saved_state is not None
+    assert saved_state.unit_on is True
+    assert state._saved_unit_button_state is saved_state
+    assert repeated_snapshot["lowBatteryOverride"] is True
+    try:
+        state.toggle_unit()
+    except RuntimeError as exc:
+        assert "low battery" in str(exc)
+    else:
+        raise AssertionError("expected low-battery guard")
+
+
+def test_rut_input_low_to_high_restores_saved_unit_state():
+    client = FakeHardwareClient()
+    state = ControlState(client, now_provider=daylight_now, start_background_threads=False)
+    state.toggle_unit()
+    state.apply_rut241_input_state("LOW")
+
+    snapshot = state.apply_rut241_input_state("HIGH")
+
+    assert snapshot["unitOn"] is True
+    assert snapshot["lowBatteryOverride"] is False
+    assert snapshot["unitButtonEnabled"] is True
+    assert snapshot["unitButtonVisualState"] == "on"
+    assert state._saved_unit_button_state is None
+
+
+def test_rut_input_low_to_unknown_keeps_safe_override():
+    client = FakeHardwareClient()
+    state = ControlState(client, now_provider=daylight_now, start_background_threads=False)
+    state.toggle_unit()
+    state.apply_rut241_input_state("LOW")
+
+    snapshot = state.apply_rut241_input_state("UNKNOWN")
+
+    assert snapshot["unitOn"] is False
+    assert snapshot["lowBatteryOverride"] is True
+    assert snapshot["lowBatteryMode"] == LowBatteryMode.UNKNOWN_WHILE_LOW.value
+    assert snapshot["unitButtonVisualState"] == "low-battery"
+
+
+def test_rut_input_unknown_to_high_only_restores_after_low_latch():
+    client = FakeHardwareClient()
+    state = ControlState(client, now_provider=daylight_now, start_background_threads=False)
+
+    snapshot = state.apply_rut241_input_state("UNKNOWN")
+    assert snapshot["lowBatteryOverride"] is False
+
+    snapshot = state.apply_rut241_input_state("HIGH")
+    assert snapshot["unitOn"] is False
+    assert snapshot["lowBatteryOverride"] is False
+
+    state.toggle_unit()
+    state.apply_rut241_input_state("LOW")
+    state.apply_rut241_input_state("UNKNOWN")
+    snapshot = state.apply_rut241_input_state("HIGH")
+
+    assert snapshot["unitOn"] is True
+    assert snapshot["lowBatteryOverride"] is False
+
+
+def test_rut_input_multiple_low_high_cycles_save_and_restore_each_cycle():
+    client = FakeHardwareClient()
+    state = ControlState(client, now_provider=daylight_now, start_background_threads=False)
+
+    state.apply_rut241_input_state("LOW")
+    snapshot = state.apply_rut241_input_state("HIGH")
+    assert snapshot["unitOn"] is False
+
+    state.toggle_unit()
+    state.apply_rut241_input_state("LOW")
+    snapshot = state.apply_rut241_input_state("HIGH")
+    assert snapshot["unitOn"] is True
+
+
+def test_rut_input_provider_mock_drives_polling_and_unknown_failure_latches_low():
+    client = FakeHardwareClient()
+    provider = FakeRut241InputProvider(["LOW", RuntimeError("connection failed"), "HIGH"])
+    state = ControlState(
+        client,
+        now_provider=daylight_now,
+        input_provider=provider,
+        start_background_threads=False,
+    )
+
+    assert state.poll_rut241_input_once()["lowBatteryOverride"] is True
+    unknown = state.poll_rut241_input_once()
+    assert unknown["lowBatteryOverride"] is True
+    assert unknown["lowBatteryMode"] == LowBatteryMode.UNKNOWN_WHILE_LOW.value
+    assert state.poll_rut241_input_once()["lowBatteryOverride"] is False
+    assert provider.calls == 3
 
 
 def test_password_hash_verification():

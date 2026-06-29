@@ -190,6 +190,7 @@ The Lightsail web app does not call the Tonmind directly. It calls authenticated
 GET /cgi-bin/custom/isaac1-relay?relay=<1|2>&action=<on|off>&token=<token>
 GET /cgi-bin/custom/isaac1-audio?action=volume&volume=<0-100>&token=<token>
 GET /cgi-bin/custom/isaac1-audio?action=start&fileid=<file-id>&token=<token>
+GET /cgi-bin/custom/isaac1-input?token=<token>
 ```
 
 The wrapper endpoints should:
@@ -199,6 +200,20 @@ The wrapper endpoints should:
 - send the corresponding local command to the Tonmind SIP-T21,
 - return JSON,
 - avoid logging token values.
+
+The input endpoint should return the RUT241 digital input state as JSON:
+
+```json
+{"ok": true, "state": "HIGH"}
+```
+
+Valid input states are:
+
+- `HIGH`: normal or recovered battery condition.
+- `LOW`: low-battery alarm active.
+- `UNKNOWN`: input state could not be confirmed.
+
+ISAAC1 treats `UNKNOWN` conservatively. If the low-battery override is already active and the input becomes `UNKNOWN`, the override remains active until `HIGH` is confirmed.
 
 Expected safe reachability test:
 
@@ -375,7 +390,7 @@ The web app shows these controls:
 
 | Button | Behavior |
 | --- | --- |
-| On/Off | Enables or disables the unit, subject to Mackay daylight hours. |
+| On/Off | Enables or disables the unit, subject to Mackay daylight hours and the low-battery override. Grey means off. Green means on. Grey flashing means low-battery override active. |
 | Sound | Turns relay 1 on, sets volume to 100, and starts the configured Tonmind sound file if it has not already been started. Turning it off sets volume to 0 and turns relay 1 off. |
 | Gas Gun | Manually toggles relay 2. |
 | Random timer | Enables automated random sound and gas-gun activations. |
@@ -387,7 +402,55 @@ Button color convention:
 - green means off/inactive,
 - red means on/active.
 
-## 17. Sound Behavior
+The On/Off button has its own color rule:
+
+- grey means off,
+- green means on,
+- grey flashing with `LOW BATTERY` means RUT241 low-battery override is active and On/Off operation is disabled.
+
+## 17. Low-Battery Override
+
+The RUT241 digital input is wired so that:
+
+- `LOW` means low-battery alarm active,
+- `HIGH` means normal or recovered.
+
+ISAAC1 polls the RUT241 input provider using `get_input_state()`. The production provider reads the RUT241 wrapper endpoint configured by `ISAAC1_RUT241_INPUT_PATH`, defaulting to:
+
+```text
+/cgi-bin/custom/isaac1-input
+```
+
+The polling interval is controlled by `ISAAC1_INPUT_POLL_SECONDS`, defaulting to 5 seconds.
+
+Low-battery state machine:
+
+| State | Meaning |
+| --- | --- |
+| `NORMAL` | No low-battery override. On/Off behaves normally. |
+| `LOW_BATTERY_OVERRIDE` | Input is confirmed `LOW`; On/Off is forced grey/flashing and disabled. |
+| `UNKNOWN_WHILE_LOW` | Input became `UNKNOWN` after a confirmed `LOW`; override remains active until `HIGH` is confirmed. |
+
+When `LOW` is detected:
+
+1. ISAAC1 saves the current On/Off button state once for that LOW event.
+2. ISAAC1 forces the unit off.
+3. The On/Off button label changes to `LOW BATTERY`.
+4. The On/Off button becomes grey and flashes.
+5. Normal On/Off operation is blocked.
+
+Repeated `LOW` readings do not overwrite the saved state or stack additional flashing effects.
+
+When `HIGH` is confirmed:
+
+1. ISAAC1 clears the low-battery override.
+2. The flashing style is removed.
+3. The saved On/Off state is restored.
+4. Normal On/Off operation is restored.
+
+If communication fails or the input state is `UNKNOWN`, ISAAC1 logs the issue. If a low-battery override is already active, ISAAC1 keeps the safe grey/flashing state and does not restore normal operation until `HIGH` is confirmed.
+
+## 18. Sound Behavior
 
 Relay 1 is tied to sound because relay 1 powers the audio amplifier.
 
@@ -404,7 +467,7 @@ When Sound is turned off:
 
 The Tonmind control API used here has start and volume commands, not a true pause/resume command. ISAAC1 therefore approximates pause/resume by muting/unmuting rather than restarting the audio every time.
 
-## 18. Gas Gun Behavior
+## 19. Gas Gun Behavior
 
 Relay 2 controls the gas gun.
 
@@ -419,7 +482,7 @@ Timer-mode Gas Gun behavior:
 - Gas gun off prevents timer-mode gas-gun pulses,
 - manual gas-gun control is separate from the timer suppression button.
 
-## 19. Random Timer Behavior
+## 20. Random Timer Behavior
 
 The random timer runs only when:
 
@@ -440,7 +503,7 @@ Timing rules:
 
 If a timer command fails, ISAAC1 records the error and disables the random timer.
 
-## 20. Daylight And Location Guard
+## 21. Daylight And Location Guard
 
 ISAAC1 is configured for Mackay, Queensland:
 
@@ -456,7 +519,7 @@ Queensland does not use daylight saving, so fixed AEST is appropriate.
 
 The unit cannot be turned on outside the daylight window. If the unit is already on and the time moves outside the daylight window, ISAAC1 turns the unit off.
 
-## 21. API Routes
+## 22. API Routes
 
 The browser talks to these local server routes:
 
@@ -483,7 +546,7 @@ When auth is enabled, API calls without a valid session return:
 {"ok": false, "error": "Authentication required"}
 ```
 
-## 22. Service Checks
+## 23. Service Checks
 
 On Lightsail:
 
@@ -523,7 +586,7 @@ Expected:
 000
 ```
 
-## 23. Updating The Software
+## 24. Updating The Software
 
 Normal update workflow:
 
@@ -548,7 +611,7 @@ Do not commit:
 - router tokens,
 - private operational data.
 
-## 24. GitHub
+## 25. GitHub
 
 The project repository is:
 
@@ -562,7 +625,7 @@ Current branch:
 main
 ```
 
-## 25. Known Limitations
+## 26. Known Limitations
 
 - Sound stop/resume is implemented through volume mute/unmute and relay 1 control, because the currently used Tonmind command path does not provide a true pause/resume primitive.
 - User accounts are file-based on the server rather than managed through an admin UI.
@@ -570,7 +633,7 @@ main
 - Daylight calculation is hard-coded for Mackay, QLD.
 - Hardware commands depend on the RUT241 wrapper endpoints and Tonmind LAN reachability.
 
-## 26. Operational Safety Notes
+## 27. Operational Safety Notes
 
 - Keep gas-gun relay wiring fail-safe.
 - Confirm relay polarity and Tonmind relay behavior before connecting real equipment.

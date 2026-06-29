@@ -9,6 +9,7 @@ import hmac
 import html
 import http.cookies
 import json
+import logging
 import math
 import os
 import random
@@ -19,12 +20,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from enum import Enum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_RUT241_URL = "http://10.23.48.89"
+DEFAULT_RUT241_INPUT_PATH = "/cgi-bin/custom/isaac1-input"
+DEFAULT_INPUT_POLL_SECONDS = 5.0
 DEFAULT_FILE_ID = 20
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -75,6 +81,23 @@ class HardwareClient(Protocol):
         ...
 
 
+class Rut241InputState(str, Enum):
+    HIGH = "HIGH"
+    LOW = "LOW"
+    UNKNOWN = "UNKNOWN"
+
+
+class LowBatteryMode(str, Enum):
+    NORMAL = "NORMAL"
+    LOW_BATTERY_OVERRIDE = "LOW_BATTERY_OVERRIDE"
+    UNKNOWN_WHILE_LOW = "UNKNOWN_WHILE_LOW"
+
+
+class Rut241InputProvider(Protocol):
+    def get_input_state(self) -> str:
+        ...
+
+
 @dataclass(frozen=True)
 class AuthUser:
     username: str
@@ -87,6 +110,14 @@ class AuthSession:
     username: str
     role: str
     expires_at: float
+
+
+@dataclass(frozen=True)
+class SavedUnitButtonState:
+    unit_on: bool
+    enabled: bool
+    label: str
+    visual_state: str
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -358,6 +389,45 @@ class TonmindOverRutClient:
         return payload
 
 
+class Rut241HttpInputProvider:
+    """Reads the RUT241 digital input through a CGI wrapper endpoint."""
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        path: str = DEFAULT_RUT241_INPUT_PATH,
+        timeout_seconds: int = 10,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.path = path
+        self.timeout_seconds = timeout_seconds
+
+    def get_input_state(self) -> str:
+        query = urllib.parse.urlencode({"token": self.token})
+        url = f"{self.base_url}{self.path}?{query}"
+        request = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                body = response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            raise RuntimeError(f"RUT241 input returned HTTP {exc.code}: {body}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"RUT241 input is unreachable: {exc.reason}") from exc
+
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"RUT241 input returned invalid JSON: {body}") from exc
+
+        if not payload.get("ok", False):
+            raise RuntimeError(f"RUT241 input command failed: {payload}")
+
+        return str(payload.get("state", Rut241InputState.UNKNOWN.value)).upper()
+
+
 class ControlState:
     """In-memory button state and hardware command sequencing."""
 
@@ -366,10 +436,15 @@ class ControlState:
         client: HardwareClient,
         sound_file_id: int = DEFAULT_FILE_ID,
         now_provider: Optional[Callable[[], dt.datetime]] = None,
+        input_provider: Optional[Rut241InputProvider] = None,
+        input_poll_seconds: float = DEFAULT_INPUT_POLL_SECONDS,
+        start_background_threads: bool = True,
     ) -> None:
         self._client = client
         self._sound_file_id = sound_file_id
         self._now_provider = now_provider or (lambda: dt.datetime.now(MACKAY_TIMEZONE))
+        self._input_provider = input_provider
+        self._input_poll_seconds = input_poll_seconds
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._manual_sound = False
@@ -384,15 +459,32 @@ class ControlState:
         self.average_interval_minutes = DEFAULT_AVERAGE_INTERVAL_MINUTES
         self.last_error = ""
         self._sound_started = False
-        self._timer_thread = threading.Thread(target=self._timer_loop, daemon=True)
-        self._timer_thread.start()
-        self._daylight_thread = threading.Thread(target=self._daylight_loop, daemon=True)
-        self._daylight_thread.start()
+        self._rut241_input_state = Rut241InputState.UNKNOWN
+        self._low_battery_mode = LowBatteryMode.NORMAL
+        self._saved_unit_button_state: Optional[SavedUnitButtonState] = None
+        self._timer_thread: Optional[threading.Thread] = None
+        self._daylight_thread: Optional[threading.Thread] = None
+        self._input_monitor_thread: Optional[threading.Thread] = None
+        if start_background_threads:
+            self._timer_thread = threading.Thread(target=self._timer_loop, daemon=True)
+            self._timer_thread.start()
+            self._daylight_thread = threading.Thread(target=self._daylight_loop, daemon=True)
+            self._daylight_thread.start()
+            if self._input_provider:
+                self._input_monitor_thread = threading.Thread(
+                    target=self._input_monitor_loop,
+                    daemon=True,
+                )
+                self._input_monitor_thread.start()
 
     def _snapshot_unlocked(self) -> dict[str, Any]:
         daylight = self._daylight_status_unlocked()
+        low_battery_active = self._low_battery_mode != LowBatteryMode.NORMAL
         return {
             "unitOn": self.unit_on,
+            "unitButtonEnabled": not low_battery_active,
+            "unitButtonLabel": "LOW BATTERY" if low_battery_active else "On/Off",
+            "unitButtonVisualState": self._unit_button_visual_state_unlocked(),
             "sound": self.sound,
             "gasGun": self.gas_gun,
             "randomTimer": self.random_timer,
@@ -401,6 +493,9 @@ class ControlState:
             "daylight": daylight["daylight"],
             "sunrise": daylight["sunrise"],
             "sunset": daylight["sunset"],
+            "rut241InputState": self._rut241_input_state.value,
+            "lowBatteryMode": self._low_battery_mode.value,
+            "lowBatteryOverride": low_battery_active,
             "lastError": self.last_error,
         }
 
@@ -411,6 +506,7 @@ class ControlState:
 
     def toggle_unit(self) -> dict[str, Any]:
         with self._condition:
+            self._require_unit_button_available_unlocked()
             if self.unit_on:
                 self._force_unit_off_unlocked()
             else:
@@ -516,9 +612,19 @@ class ControlState:
             )
 
     def _require_operational_unlocked(self) -> None:
+        self._require_unit_button_available_unlocked()
         self._require_daylight_unlocked()
         if not self.unit_on:
             raise RuntimeError("Unit is off")
+
+    def _require_unit_button_available_unlocked(self) -> None:
+        if self._low_battery_mode != LowBatteryMode.NORMAL:
+            raise RuntimeError("Unit unavailable: low battery alarm active")
+
+    def _unit_button_visual_state_unlocked(self) -> str:
+        if self._low_battery_mode != LowBatteryMode.NORMAL:
+            return "low-battery"
+        return "on" if self.unit_on else "off"
 
     def _is_daylight_unlocked(self) -> bool:
         return is_mackay_daylight(self._now_provider())
@@ -651,6 +757,102 @@ class ControlState:
                 self._condition.wait(timeout=remaining)
             return False
 
+    def poll_rut241_input_once(self) -> dict[str, Any]:
+        if not self._input_provider:
+            return self.snapshot()
+        try:
+            input_state = self._input_provider.get_input_state()
+        except Exception as exc:
+            logger.warning("RUT241 input communication error: %s", exc)
+            input_state = Rut241InputState.UNKNOWN.value
+        return self.apply_rut241_input_state(input_state)
+
+    def apply_rut241_input_state(self, input_state: str) -> dict[str, Any]:
+        normalized_state = self._normalize_input_state(input_state)
+        with self._condition:
+            previous_state = self._rut241_input_state
+            if normalized_state != previous_state:
+                logger.info(
+                    "RUT241 input changed %s -> %s",
+                    previous_state.value,
+                    normalized_state.value,
+                )
+            self._rut241_input_state = normalized_state
+
+            if normalized_state == Rut241InputState.LOW:
+                self._apply_low_battery_override_unlocked()
+            elif normalized_state == Rut241InputState.HIGH:
+                self._restore_low_battery_override_unlocked()
+                if self.last_error.startswith("Low battery"):
+                    self.last_error = ""
+            else:
+                self._handle_unknown_input_unlocked()
+
+            self._condition.notify_all()
+            return self._snapshot_unlocked()
+
+    def _input_monitor_loop(self) -> None:
+        while True:
+            self.poll_rut241_input_once()
+            with self._condition:
+                self._condition.wait(timeout=self._input_poll_seconds)
+
+    def _normalize_input_state(self, input_state: str) -> Rut241InputState:
+        normalized = str(input_state).strip().upper()
+        if normalized == Rut241InputState.HIGH.value:
+            return Rut241InputState.HIGH
+        if normalized == Rut241InputState.LOW.value:
+            return Rut241InputState.LOW
+        return Rut241InputState.UNKNOWN
+
+    def _apply_low_battery_override_unlocked(self) -> None:
+        if self._low_battery_mode == LowBatteryMode.NORMAL:
+            self._saved_unit_button_state = SavedUnitButtonState(
+                unit_on=self.unit_on,
+                enabled=True,
+                label="On/Off",
+                visual_state=self._unit_button_visual_state_unlocked(),
+            )
+            logger.info(
+                "Applying low-battery override; saved On/Off state unit_on=%s",
+                self.unit_on,
+            )
+            self._force_unit_off_unlocked()
+            self.last_error = "Low battery alarm active"
+        self._low_battery_mode = LowBatteryMode.LOW_BATTERY_OVERRIDE
+
+    def _restore_low_battery_override_unlocked(self) -> None:
+        if self._low_battery_mode == LowBatteryMode.NORMAL:
+            return
+
+        saved_state = self._saved_unit_button_state
+        if saved_state:
+            self.unit_on = saved_state.unit_on
+            logger.info(
+                "Restored On/Off button state after low-battery recovery: unit_on=%s",
+                saved_state.unit_on,
+            )
+        else:
+            logger.info("Cleared low-battery override with no saved On/Off state")
+        self._saved_unit_button_state = None
+        self._low_battery_mode = LowBatteryMode.NORMAL
+        self.last_error = ""
+
+    def _handle_unknown_input_unlocked(self) -> None:
+        if self._low_battery_mode == LowBatteryMode.LOW_BATTERY_OVERRIDE:
+            self._low_battery_mode = LowBatteryMode.UNKNOWN_WHILE_LOW
+            self.last_error = "Low battery input state unknown; keeping override active"
+            logger.warning(
+                "RUT241 input became UNKNOWN while low-battery override is active; "
+                "keeping override until HIGH is confirmed"
+            )
+        elif self._low_battery_mode == LowBatteryMode.UNKNOWN_WHILE_LOW:
+            logger.warning(
+                "RUT241 input remains UNKNOWN while low-battery override is active"
+            )
+        else:
+            logger.warning("RUT241 input state is UNKNOWN")
+
 
 LOGIN_HTML = """<!doctype html>
 <html lang="en">
@@ -773,6 +975,12 @@ INDEX_HTML = """<!doctype html>
       --off-dark: #0c6336;
       --on: #cf2f2f;
       --on-dark: #9f1f1f;
+      --unit-off: #7b807c;
+      --unit-off-dark: #616761;
+      --unit-on: #14844a;
+      --unit-on-dark: #0c6336;
+      --low-battery: #777c78;
+      --low-battery-dark: #4f5550;
       --panel: #ffffff;
       --focus: #1d5fd1;
     }
@@ -868,6 +1076,42 @@ INDEX_HTML = """<!doctype html>
       background: var(--on-dark);
     }
 
+    #unitOn[data-low-battery="false"][data-active="false"] {
+      background: var(--unit-off);
+    }
+
+    #unitOn[data-low-battery="false"][data-active="false"]:hover {
+      background: var(--unit-off-dark);
+    }
+
+    #unitOn[data-low-battery="false"][data-active="true"] {
+      background: var(--unit-on);
+    }
+
+    #unitOn[data-low-battery="false"][data-active="true"]:hover {
+      background: var(--unit-on-dark);
+    }
+
+    #unitOn[data-low-battery="true"] {
+      animation: lowBatteryFlash 900ms ease-in-out infinite alternate;
+      background: var(--low-battery);
+      cursor: not-allowed;
+    }
+
+    #unitOn[data-low-battery="true"]:disabled {
+      opacity: 1;
+    }
+
+    @keyframes lowBatteryFlash {
+      from {
+        background: var(--low-battery);
+      }
+
+      to {
+        background: var(--low-battery-dark);
+      }
+    }
+
     button.control:focus-visible,
     button.step:focus-visible {
       outline: 4px solid var(--focus);
@@ -880,7 +1124,7 @@ INDEX_HTML = """<!doctype html>
       box-shadow: inset 0 -3px 0 rgba(0, 0, 0, 0.2);
     }
 
-    button.control:disabled,
+    button.control:disabled:not([data-low-battery="true"]),
     button.step:disabled {
       cursor: wait;
       opacity: 0.72;
@@ -966,7 +1210,7 @@ INDEX_HTML = """<!doctype html>
       </div>
     </header>
     <section class="controls" aria-label="Hardware controls">
-      <button class="control" id="unitOn" type="button" data-active="false">On/Off</button>
+      <button class="control" id="unitOn" type="button" data-active="false" data-low-battery="false">On/Off</button>
       <button class="control" id="sound" type="button" data-active="false">Sound</button>
       <button class="control" id="gasGun" type="button" data-active="false">Gas Gun</button>
       <button class="control" id="randomTimer" type="button" data-active="false">Random timer</button>
@@ -990,15 +1234,23 @@ INDEX_HTML = """<!doctype html>
     };
     const status = document.getElementById("status");
     const intervalValue = document.getElementById("intervalValue");
+    let currentState = null;
 
     function setBusy(isBusy) {
       Object.values(buttons).forEach((button) => {
         button.disabled = isBusy;
       });
+      if (currentState && currentState.lowBatteryOverride) {
+        buttons.unitOn.disabled = true;
+      }
     }
 
     function render(state) {
+      currentState = state;
       buttons.unitOn.dataset.active = String(Boolean(state.unitOn));
+      buttons.unitOn.dataset.lowBattery = String(Boolean(state.lowBatteryOverride));
+      buttons.unitOn.disabled = !Boolean(state.unitButtonEnabled);
+      buttons.unitOn.textContent = state.unitButtonLabel || "On/Off";
       buttons.sound.dataset.active = String(Boolean(state.sound));
       buttons.gasGun.dataset.active = String(Boolean(state.gasGun));
       buttons.randomTimer.dataset.active = String(Boolean(state.randomTimer));
@@ -1042,7 +1294,13 @@ INDEX_HTML = """<!doctype html>
       }
     }
 
-    buttons.unitOn.addEventListener("click", () => request("/api/unit/toggle"));
+    buttons.unitOn.addEventListener("click", () => {
+      if (currentState && currentState.lowBatteryOverride) {
+        status.textContent = "Low battery alarm active";
+        return;
+      }
+      request("/api/unit/toggle");
+    });
     buttons.sound.addEventListener("click", () => request("/api/sound/toggle"));
     buttons.gasGun.addEventListener("click", () => request("/api/gas-gun/toggle"));
     buttons.randomTimer.addEventListener("click", () => request("/api/random-timer/toggle"));
@@ -1250,6 +1508,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bind", default=DEFAULT_BIND)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--rut-url", default=os.environ.get("ISAAC1_RUT241_URL", DEFAULT_RUT241_URL))
+    parser.add_argument(
+        "--rut-input-path",
+        default=os.environ.get("ISAAC1_RUT241_INPUT_PATH", DEFAULT_RUT241_INPUT_PATH),
+    )
+    parser.add_argument(
+        "--input-poll-seconds",
+        type=float,
+        default=float(os.environ.get("ISAAC1_INPUT_POLL_SECONDS", DEFAULT_INPUT_POLL_SECONDS)),
+    )
     parser.add_argument("--token-env", default="ISAAC1_CONTROL_TOKEN")
     parser.add_argument("--sound-file-id", type=int, default=DEFAULT_FILE_ID)
     return parser
@@ -1261,9 +1528,17 @@ def run_server(
     rut_url: str,
     token: str,
     sound_file_id: int = DEFAULT_FILE_ID,
+    rut_input_path: str = DEFAULT_RUT241_INPUT_PATH,
+    input_poll_seconds: float = DEFAULT_INPUT_POLL_SECONDS,
 ) -> None:
     client = TonmindOverRutClient(rut_url, token)
-    state = ControlState(client, sound_file_id=sound_file_id)
+    input_provider = Rut241HttpInputProvider(rut_url, token, path=rut_input_path)
+    state = ControlState(
+        client,
+        sound_file_id=sound_file_id,
+        input_provider=input_provider,
+        input_poll_seconds=input_poll_seconds,
+    )
     auth = AuthManager.from_env()
     handler = make_handler(state, auth)
     server = ThreadingHTTPServer((bind, port), handler)
@@ -1272,12 +1547,24 @@ def run_server(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    logging.basicConfig(
+        level=os.environ.get("ISAAC1_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     parser = build_parser()
     args = parser.parse_args(argv)
     token = os.environ.get(args.token_env, "")
     if not token:
         parser.error(f"{args.token_env} is required")
-    run_server(args.bind, args.port, args.rut_url, token, args.sound_file_id)
+    run_server(
+        args.bind,
+        args.port,
+        args.rut_url,
+        token,
+        args.sound_file_id,
+        args.rut_input_path,
+        args.input_poll_seconds,
+    )
     return 0
 
 

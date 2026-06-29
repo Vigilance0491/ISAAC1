@@ -104,6 +104,8 @@ def build_parser() -> argparse.ArgumentParser:
     control.add_argument("--bind", default="127.0.0.1")
     control.add_argument("--port", type=int, default=8765)
     control.add_argument("--rut-url", default=None)
+    control.add_argument("--rut-input-path", default=None)
+    control.add_argument("--input-poll-seconds", type=float, default=None)
     control.add_argument("--token-env", default="ISAAC1_CONTROL_TOKEN")
     control.add_argument("--sound-file-id", type=int, default=20)
 
@@ -142,11 +144,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             str(args.port),
             "--rut-url",
             args.rut_url or DEFAULT_RUT241_URL,
+            "--rut-input-path",
+            args.rut_input_path or "/cgi-bin/custom/isaac1-input",
             "--token-env",
             args.token_env,
             "--sound-file-id",
             str(args.sound_file_id),
         ]
+        if args.input_poll_seconds is not None:
+            control_args.extend(["--input-poll-seconds", str(args.input_poll_seconds)])
         return control_main(control_args)
 
     parser.print_help()
